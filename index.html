@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pengunci Tautan Sekali Pakai</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <script type="module">
+        // Import Firebase modules
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, getDoc, updateDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // Konstanta untuk jalur penyimpanan publik di Firestore
+        const COLLECTION_NAME = "protected_links";
+        
+        // --- Enkripsi Dasar (Untuk penyembunyian, bukan keamanan tinggi) ---
+        const getEncryptionKey = () => {
+            // Menggunakan bagian dari App ID sebagai kunci XOR sederhana
+            const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+            return Array.from(appId.slice(0, 16)).map(c => c.charCodeAt(0));
+        };
+
+        const xorEncryptDecrypt = (data, key) => {
+            let result = '';
+            for (let i = 0; i < data.length; i++) {
+                const charCode = data.charCodeAt(i);
+                const keyChar = key[i % key.length];
+                result += String.fromCharCode(charCode ^ keyChar);
+            }
+            return result;
+        };
+
+        const encryptLink = (link, password) => {
+            const key = getEncryptionKey();
+            const combined = `${link}|${password}`;
+            const base64Encoded = btoa(combined);
+            const encrypted = xorEncryptDecrypt(base64Encoded, key);
+            return btoa(encrypted);
+        };
+
+        const decryptLink = (encryptedData) => {
+            const key = getEncryptionKey();
+            try {
+                const base64XOREncrypted = atob(encryptedData);
+                const xorDecrypted = xorEncryptDecrypt(base64XOREncrypted, key);
+                const combined = atob(xorDecrypted);
+                
+                const parts = combined.split('|');
+                if (parts.length === 2) {
+                    return { link: parts[0], password: parts[1] };
+                }
+            } catch (error) {
+                console.error("Decryption failed:", error);
+            }
+            return null; 
+        };
+        // --- End Enkripsi ---
+
+        // Konfigurasi dan Inisialisasi Firebase
+        let db, auth, userId;
+        let isAuthReady = false;
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+        const initFirebase = async () => {
+            setLogLevel('debug'); 
+            try {
+                const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                // Autentikasi menggunakan token kustom (jika tersedia) atau anonim
+                if (typeof __initial_auth_token !== 'undefined') {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+                
+                userId = auth.currentUser?.uid || crypto.randomUUID();
+                document.getElementById('user-id-display').textContent = userId;
+                isAuthReady = true;
+
+                // Jika di mode unlocker, aktifkan tombol setelah auth siap
+                const openLinkBtn = document.getElementById('open-link-btn');
+                if (openLinkBtn && openLinkBtn.hasAttribute('disabled')) {
+                     openLinkBtn.disabled = false;
+                }
+
+            } catch (error) {
+                console.error("Error initializing Firebase:", error);
+                document.getElementById('message-box-main').textContent = `Kesalahan Firebase: ${error.message}`;
+                document.getElementById('message-box-main').classList.remove('hidden', 'bg-green-100');
+                document.getElementById('message-box-main').classList.add('bg-red-100', 'text-red-800');
+            }
+        };
+
+        // Fungsi Utilities UI
+        const showMessage = (message, type = 'info', elementId = 'message-box-main') => {
+            const msgBox = document.getElementById(elementId);
+            msgBox.textContent = message;
+            msgBox.classList.remove('hidden', 'bg-green-100', 'bg-red-100', 'text-green-800', 'text-red-800');
+            if (type === 'error') {
+                msgBox.classList.add('bg-red-100', 'text-red-800');
+            } else {
+                msgBox.classList.add('bg-green-100', 'text-green-800');
+            }
+        };
+
+        const hideMessage = (elementId = 'message-box-main') => {
+            document.getElementById(elementId).classList.add('hidden');
+        };
+
+        const copyToClipboard = (text, btnElement) => {
+            const tempInput = document.createElement('textarea');
+            tempInput.value = text;
+            document.body.appendChild(tempInput);
+            tempInput.select();
+            document.execCommand('copy');
+            document.body.removeChild(tempInput);
+            
+            const originalText = btnElement.textContent;
+            btnElement.textContent = 'Disalin!';
+            setTimeout(() => {
+                copyBtn.textContent = originalText;
+            }, 2000);
+        };
+
+        // --- Fungsi Utama Aplikasi (Mode Pembuatan) ---
+        const createLink = async () => {
+            if (!isAuthReady) {
+                showMessage("Firebase belum siap. Tunggu sebentar atau coba lagi.", 'error', 'message-box-main');
+                return;
+            }
+
+            const originalLink = document.getElementById('original-link').value.trim();
+            const password = document.getElementById('password').value.trim();
+            const resultDiv = document.getElementById('creation-result');
+            resultDiv.classList.add('hidden');
+            hideMessage('message-box-main');
+
+            if (!originalLink || !password) {
+                showMessage("Tautan dan Sandi harus diisi.", 'error', 'message-box-main');
+                return;
+            }
+            if (!originalLink.startsWith('http')) {
+                showMessage("Tautan harus dimulai dengan http:// atau https://", 'error', 'message-box-main');
+                return;
+            }
+            if (password.length < 4) {
+                 showMessage("Sandi minimal harus 4 karakter.", 'error', 'message-box-main');
+                return;
+            }
+
+            try {
+                const linkId = crypto.randomUUID().slice(0, 8);
+                const encryptedData = encryptLink(originalLink, password);
+                
+                // Jalur publik untuk sharing global
+                const linkDocRef = doc(db, `artifacts/${appId}/public/data/${COLLECTION_NAME}`, linkId);
+
+                await setDoc(linkDocRef, {
+                    encryptedData: encryptedData,
+                    createdAt: new Date().toISOString(),
+                    owner: userId,
+                    isUsed: false, // Flag: Tautan belum digunakan
+                    linkType: 'single-use'
+                });
+
+                // Dapatkan base URL dari URL yang sedang berjalan (di GitHub Pages)
+                const baseUrl = window.location.href.split('?')[0];
+                const shareableLink = `${baseUrl}?id=${linkId}`;
+
+                document.getElementById('shareable-link-output').value = shareableLink;
+                
+                resultDiv.classList.remove('hidden');
+                showMessage("Tautan berhasil dikunci! Tautan ini hanya bisa dibuka sekali. Salin URL LENGKAP di bawah.", 'info', 'message-box-main');
+
+            } catch (e) {
+                console.error("Error creating link:", e);
+                showMessage(`Gagal membuat tautan: ${e.message}`, 'error', 'message-box-main');
+            }
+        };
+
+
+        // --- Fungsi Utama Aplikasi (Mode Pembuka) ---
+        const openLink = async (linkId) => {
+            if (!isAuthReady) {
+                showMessage("Firebase belum siap. Tunggu sebentar atau coba lagi.", 'error', 'unlocker-message');
+                return;
+            }
+            
+            const unlockerPassword = document.getElementById('unlocker-password').value.trim();
+            const unlockerButton = document.getElementById('open-link-btn');
+
+            hideMessage('unlocker-message');
+            unlockerButton.disabled = true;
+
+            if (!unlockerPassword) {
+                showMessage("Masukkan Sandi untuk membuka.", 'error', 'unlocker-message');
+                unlockerButton.disabled = false;
+                return;
+            }
+
+            const linkDocRef = doc(db, `artifacts/${appId}/public/data/${COLLECTION_NAME}`, linkId);
+
+            try {
+                const docSnap = await getDoc(linkDocRef);
+
+                if (!docSnap.exists()) {
+                    showMessage("Tautan tidak valid atau sudah kedaluwarsa.", 'error', 'unlocker-message');
+                    return;
+                }
+
+                const data = docSnap.data();
+
+                // 1. Cek Status Penggunaan (Single-Use)
+                if (data.isUsed) {
+                    showMessage("Tautan ini sudah digunakan dan tidak berlaku lagi.", 'error', 'unlocker-message');
+                    return;
+                }
+
+                const decrypted = decryptLink(data.encryptedData);
+
+                if (!decrypted) {
+                    showMessage("Kesalahan dekripsi. Tautan rusak.", 'error', 'unlocker-message');
+                    return;
+                }
+
+                // 2. Cek Sandi
+                if (decrypted.password === unlockerPassword) {
+                    
+                    // Sandi Benar dan Belum Digunakan: Lakukan update isUsed: true
+                    await updateDoc(linkDocRef, {
+                        isUsed: true,
+                        usedBy: userId, 
+                        usedAt: new Date().toISOString()
+                    });
+
+                    // 3. Redirect
+                    showMessage("Sandi benar! Mengarahkan ke tautan... Tautan ini akan dinonaktifkan.", 'info', 'unlocker-message');
+                    
+                    setTimeout(() => {
+                        window.location.href = decrypted.link;
+                    }, 1500);
+
+                } else {
+                    showMessage("Sandi salah. Coba lagi.", 'error', 'unlocker-message');
+                }
+
+            } catch (e) {
+                console.error("Error opening link:", e);
+                showMessage(`Gagal membuka tautan: ${e.message}`, 'error', 'unlocker-message');
+            } finally {
+                unlockerButton.disabled = false;
+            }
+        };
+
+        // --- Inisialisasi dan Logika URL ---
+        document.addEventListener('DOMContentLoaded', async () => {
+            // Init Firebase di background
+            initFirebase();
+            
+            const params = new URLSearchParams(window.location.search);
+            const linkId = params.get('id');
+
+            const creatorSection = document.getElementById('creator-section');
+            const unlockerSection = document.getElementById('unlocker-section');
+            const openLinkBtn = document.getElementById('open-link-btn');
+
+            if (linkId) {
+                // Mode Pembuka (Unlocker)
+                creatorSection.classList.add('hidden');
+                unlockerSection.classList.remove('hidden');
+                document.getElementById('link-id-display').textContent = linkId;
+                
+                openLinkBtn.addEventListener('click', () => openLink(linkId));
+                document.getElementById('unlocker-password').addEventListener('keypress', (e) => {
+                    if (e.key === 'Enter') openLink(linkId);
+                });
+                
+                openLinkBtn.disabled = true; 
+            } else {
+                // Mode Pembuat (Creator)
+                unlockerSection.classList.add('hidden');
+                creatorSection.classList.remove('hidden');
+                document.getElementById('create-link-btn').addEventListener('click', createLink);
+            }
+        });
+        
+        window.copyToClipboard = (elementId, btnElement) => {
+             const textToCopy = document.getElementById(elementId).value;
+             copyToClipboard(textToCopy, btnElement);
+        };
+
+    </script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f7f9fc;
+            color: #1f2937;
+        }
+        .container {
+            max-width: 500px;
+            margin: 2rem auto;
+            padding: 2rem;
+            background-color: #fff;
+            border-radius: 1rem;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        }
+        input[type="text"], input[type="password"], textarea {
+            border: 1px solid #d1d5db;
+            border-radius: 0.5rem;
+            padding: 0.75rem;
+            width: 100%;
+            background-color: #f9fafb;
+            transition: all 0.2s;
+        }
+        input:focus {
+            outline: none;
+            border-color: #f59e0b; 
+            box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.2);
+        }
+        .btn-primary {
+            background-color: #f59e0b; 
+            color: white;
+            padding: 0.75rem 1.5rem;
+            border-radius: 0.5rem;
+            font-weight: 700;
+            transition: background-color 0.2s;
+        }
+        .btn-primary:hover:not(:disabled) {
+            background-color: #d97706;
+        }
+        .btn-primary:disabled {
+            background-color: #fcd34d;
+            cursor: not-allowed;
+        }
+        .input-group {
+            margin-bottom: 1rem;
+        }
+    </style>
+</head>
+<body class="p-4">
+
+    <div class="container">
+        <h1 class="text-3xl font-bold text-center mb-6 text-yellow-700">💣 Pengunci Tautan Sekali Pakai</h1>
+        <p class="text-center text-sm text-gray-500 mb-8">Tautan ini hanya dapat dibuka sekali, kemudian akan dinonaktifkan selamanya.</p>
+
+        <!-- Pesan Utama -->
+        <div id="message-box-main" class="hidden p-3 rounded-lg text-sm mb-4"></div>
+
+        <!-- Bagian Pembuat Tautan (Mode Default) -->
+        <div id="creator-section" class="space-y-4">
+            <h2 class="text-xl font-semibold mb-4 border-b pb-2">Buat Tautan Penghancur Diri</h2>
+
+            <div class="input-group">
+                <label for="original-link" class="block text-sm font-medium text-gray-700 mb-2">Tautan Asli (URL Penuh):</label>
+                <input type="text" id="original-link" placeholder="https://dokumen-rahasia.com/sekali-baca" required>
+            </div>
+
+            <div class="input-group">
+                <label for="password" class="block text-sm font-medium text-gray-700 mb-2">Sandi Pembuka (Minimal 4 Karakter):</label>
+                <input type="password" id="password" placeholder="Sandi Rahasia" required>
+            </div>
+
+            <button id="create-link-btn" class="btn-primary w-full mt-2">Kunci Tautan (Sekali Pakai) Sekarang</button>
+
+            <!-- Hasil Pembuatan Tautan -->
+            <div id="creation-result" class="hidden mt-6 p-4 border border-yellow-200 bg-yellow-50 rounded-lg space-y-3">
+                <p class="font-semibold text-yellow-700">Tautan Berbagi Anda (Ingat, Sekali Pakai!):</p>
+                <div class="flex items-center space-x-2">
+                    <input type="text" id="shareable-link-output" class="flex-grow bg-white" readonly>
+                    <button 
+                        class="bg-yellow-600 text-white p-2 rounded-md hover:bg-yellow-700" 
+                        onclick="copyToClipboard('shareable-link-output', this)">
+                        Salin
+                    </button>
+                </div>
+                <p class="text-xs text-gray-600 italic font-bold text-red-600">PENTING: Gunakan tombol 'Salin' di atas untuk mendapatkan URL lengkap.</p>
+            </div>
+        </div>
+
+        <!-- Bagian Pembuka Tautan (Mode ID URL) -->
+        <div id="unlocker-section" class="hidden space-y-4">
+            <h2 class="text-xl font-semibold mb-4 border-b pb-2 text-red-600">Buka Tautan Sekali Pakai</h2>
+            
+            <p class="text-sm text-gray-600">ID Tautan: <span id="link-id-display" class="font-mono bg-gray-100 p-1 rounded-sm"></span></p>
+
+            <!-- Pesan Unlocker -->
+            <div id="unlocker-message" class="hidden p-3 rounded-lg text-sm mb-4"></div>
+            
+            <div class="input-group">
+                <label for="unlocker-password" class="block text-sm font-medium text-gray-700 mb-2">Masukkan Sandi Pembuka:</label>
+                <input type="password" id="unlocker-password" placeholder="Sandi" required>
+            </div>
+
+            <button id="open-link-btn" class="btn-primary w-full mt-2" disabled>Buka Tautan (Dan Nonaktifkan)</button>
+
+            <p class="text-xs text-gray-500 text-center mt-4">Tautan ini hanya bisa dibuka oleh pengguna pertama yang memasukkan sandi yang benar.</p>
+        </div>
+        
+        <p class="text-center text-xs text-gray-400 mt-8">ID Pengguna: <span id="user-id-display"></span></p>
+
+    </div>
+
+</body>
+</html>
+
