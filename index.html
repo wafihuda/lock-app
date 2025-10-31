@@ -67,8 +67,7 @@
         const initFirebase = async () => {
             setLogLevel('debug'); 
             try {
-                const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
-                const app = initializeApp(firebaseConfig);
+                npm install firebase
                 db = getFirestore(app);
                 auth = getAuth(app);
                 
